@@ -1,0 +1,21 @@
+{
+  "name": "hardhat-project",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.26.3"
+  },
+  "dependencies": {
+    "@hashgraph/sdk": "^2.72.0",
+    "@openzeppelin/contracts": "^5.4.0",
+    "dotenv": "^17.2.2"
+  },
+  "scripts": {
+    "build": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:contracts": "hardhat run scripts/02_deploy_contracts.ts --network hardhat",
+    "oracle:setPrice": "hardhat run scripts/03_oracle_set_price.ts --network hedera_testnet",
+    "oracle:setBand": "hardhat run scripts/04_oracle_set_band.ts --network hedera_testnet",
+    "hedera:create": "ts-node scripts/01_create_hts_tokens.ts",
+    "mirror:trades": "ts-node scripts/05_mirror_read_trades.ts"
+  }
+}
