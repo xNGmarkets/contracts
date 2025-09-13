@@ -8,10 +8,10 @@ async function main() {
 
   const clob = await Clob.deploy(
     owner,
-    "0xc51076c08596D3007DC4673bb8E64BAc2B2eBd19", //owner
-    "0x4a4078Fe786E20476d1cA1c87Cd491bD16c3fE48", //oracle
-    "0x000000000000000000000000000000000067e4af", //adapter
-    "0x000000000000000000000000000000000067e65e" //fee sink
+    process.env.ORACLEHUB_CONTRACT,
+    process.env.DIRECT_SETTLE_ADAPTER,
+    process.env.USDC_CONTRACT,
+    process.env.FEE_SINK_EVM //fee sink
   );
   await clob.waitForDeployment();
 
