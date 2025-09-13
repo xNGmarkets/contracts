@@ -57,9 +57,39 @@ contract OracleHub is IOracleHub {
         emit PriceSet(asset, p.priceE6, p.seq, p.ts, p.hcsMsgId);
     }
 
+    function setPrices(
+        address[] memory assets,
+        PricePayload[] calldata ps
+    ) external onlyOwner {
+        require(assets.length == ps.length, "Length mismatch");
+
+        for (uint256 i = 0; i < assets.length; i++) {
+            _price[assets[i]] = ps[i];
+            emit PriceSet(
+                assets[i],
+                ps[i].priceE6,
+                ps[i].seq,
+                ps[i].ts,
+                ps[i].hcsMsgId
+            );
+        }
+    }
+
     function setBand(address asset, BandPayload calldata b) external onlyOwner {
         _band[asset] = b;
         emit BandSet(asset, b.midE6, b.widthBps, b.ts);
+    }
+
+    function setBands(
+        address[] memory assets,
+        BandPayload[] calldata bs
+    ) external onlyOwner {
+        require(assets.length == bs.length, "Length mismatch");
+
+        for (uint256 i = 0; i < assets.length; i++) {
+            _band[assets[i]] = bs[i];
+            emit BandSet(assets[i], bs[i].midE6, bs[i].widthBps, bs[i].ts);
+        }
     }
 
     function getPrice(

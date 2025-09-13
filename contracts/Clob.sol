@@ -9,17 +9,19 @@ pragma solidity ^0.8.20;
  *  - Users must approve the adapter for the required amounts (USDC for buyer; xNGX for seller).
  *  - On Hedera HTS via EVM addresses: users (and the fee sink) must be associated (and KYC’d if enforced).
  *
- * Conventions:
- *  - USDC and all xNGX tokens use 6 decimals.
- *  - Prices are in USD * 1e6 (pxE6). Notional = qty * pxE6.
- *  - Fees are taken in USDC (quote), not from asset quantity.
+ * **Invariants & Units**
+ *  - USDC and all xNGX tokens use 6 decimals (1 token = 1e6 base units)
+ *  - Prices are in USD * 1e6 (pxE6). Example: $4.17 → 4_170_000
+ *  - Quantities (qty) are in asset base units (1e6). Example: 100 tokens → 100_000_000
+ *  - **Notional is computed as (qty * pxE6) / 1e6** to keep result in USD * 1e6
+ *  - Fees are taken in USDC (quote), not from asset quantity
  *
  * Notes:
  *  - Band enforced at entry AND at match time; stale oracle halts matching.
  */
 
-import "./IOracleHub.sol"; // interface with PricePayload, BandPayload, getBand/getPrice/maxStaleness
-import "./IMoveAdapter.sol"; // interface { function move(address token, address from, address to, uint256 amount) external; }
+import {IOracleHub} from "./interfaces/IOracleHub.sol";
+import {IMoveAdapter} from "./interfaces/IMoveAdapter.sol";
 
 contract Clob {
     // ============ Types ============
@@ -34,11 +36,11 @@ contract Clob {
     }
 
     struct Order {
-        address trader;
-        address asset; // xNGX token (HTS EVM address is fine)
+        address trader; // EOA placing the order
+        address asset; // xNGX token (HTS EVM address ok)
         Side side; // buy or sell
         bool isMarket; // market vs limit
-        uint128 qty; // asset units (assume 6dp)
+        uint128 qty; // asset units (6 dp)
         uint128 pxE6; // USD * 1e6 (ignored for market)
         uint64 ts; // place timestamp
         bool active; // open on book
@@ -51,7 +53,7 @@ contract Clob {
 
     // ============ Storage ============
     address public owner;
-    address public immutable USDC; // quote token (6dp)
+    address public immutable USDC; // quote token (6 dp)
     IOracleHub public oracle;
     IMoveAdapter public adapter;
     address public feeSink; // receives fees in USDC
@@ -170,6 +172,7 @@ contract Clob {
         return orders.length;
     }
 
+    /// @notice Returns current band range for an asset using oracle mid/width
     function bandRange(
         address asset
     ) public view returns (uint256 lo, uint256 hi, uint64 ts) {
@@ -181,28 +184,26 @@ contract Clob {
         ts = b.ts;
     }
 
+    /// @dev Oracle freshness guard
     function isFresh(uint64 ts) public view returns (bool) {
         uint64 maxS = oracle.maxStaleness();
         return (block.timestamp <= uint256(ts) + uint256(maxS));
     }
 
+    /// @notice Best bid/ask snapshot by linear scan (sufficient for MVP)
     function best(address asset) external view returns (BestPx memory bp) {
         uint256[] storage B = bids[asset];
         uint256[] storage A = asks[asset];
         uint128 bestBid;
         uint128 bestAsk;
-
         for (uint256 i = 0; i < B.length; i++) {
             Order storage o = orders[B[i]];
-            if (o.active && o.pxE6 > bestBid) {
-                bestBid = o.pxE6;
-            }
+            if (o.active && o.pxE6 > bestBid) bestBid = o.pxE6;
         }
         for (uint256 j = 0; j < A.length; j++) {
             Order storage o = orders[A[j]];
-            if (o.active && (bestAsk == 0 || o.pxE6 < bestAsk)) {
+            if (o.active && (bestAsk == 0 || o.pxE6 < bestAsk))
                 bestAsk = o.pxE6;
-            }
         }
         bp = BestPx(bestBid, bestAsk);
     }
@@ -260,7 +261,6 @@ contract Clob {
         uint256 maxMatches
     ) external nonReentrant {
         require(venue[asset] == VenueState.Continuous, "venue off");
-
         (uint256 lo, uint256 hi, uint64 ts) = bandRange(asset);
         require(isFresh(ts), "stale/halt");
 
@@ -278,6 +278,9 @@ contract Clob {
                 Order storage sell = orders[sellId];
                 if (!sell.active) continue;
                 if (sell.asset != asset || buy.asset != asset) continue;
+
+                // Prevent self-trade
+                if (buy.trader == sell.trader) continue;
 
                 uint128 execPxE6 = _executablePx(buy, sell);
                 if (execPxE6 == 0) continue; // not crossed
@@ -323,22 +326,23 @@ contract Clob {
         require(buy.active && sell.active, "inactive");
         require(qty > 0, "qty0");
 
-        // Notional in USD*1e6
-        uint256 notionalE6 = uint256(qty) * uint256(pxE6);
-        uint256 feeE6 = (notionalE6 * feeBps) / 10000;
+        // === Correct notional math ===
+        // qty and pxE6 are both scaled by 1e6, so divide by 1e6 to keep result in USD*1e6
+        uint256 notionalE6 = (uint256(qty) * uint256(pxE6)) / 1e6;
+        uint256 feeE6 = (notionalE6 * feeBps) / 10000; // bps
 
-        // DIRECT-SETTLE (no custody in adapter):
-        // USDC (buyer -> seller, and buyer -> fee sink)
+        // DIRECT-SETTLE (adapter only transferFroms; holds no balances)
+        //  - USDC from buyer → seller, and buyer → feeSink
         adapter.move(USDC, buy.trader, sell.trader, notionalE6);
         adapter.move(USDC, buy.trader, feeSink, feeE6);
 
-        // Asset (seller -> buyer)
+        //  - Asset from seller → buyer
         adapter.move(asset, sell.trader, buy.trader, qty);
 
         // Reduce open quantities / close if filled
         buy.qty -= qty;
-        sell.qty -= qty;
         if (buy.qty == 0) buy.active = false;
+        sell.qty -= qty;
         if (sell.qty == 0) sell.active = false;
 
         emit Trade(

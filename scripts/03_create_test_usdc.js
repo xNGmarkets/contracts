@@ -1,5 +1,5 @@
-// create_usdc_hts.js
 require("dotenv").config();
+
 const {
   Client,
   PrivateKey,
@@ -10,12 +10,12 @@ const {
   Hbar,
 } = require("@hashgraph/sdk");
 
-(async () => {
-  const operatorKey = loadECDSA(process.env.OPERATOR_KEY);
+(async function main() {
+  const operatorKey = PrivateKey.fromStringECDSA(process.env.OPERATOR_KEY);
   const operatorId = AccountId.fromString(process.env.ACCOUNT_ID);
   const client = Client.forTestnet().setOperator(operatorId, operatorKey);
 
-  const name = "USD Coin (HTS)";
+  const name = "USD Coin (xNG)";
   const symbol = "USDC";
   const tx = new TokenCreateTransaction()
     .setTokenName(name)
@@ -25,7 +25,6 @@ const {
     .setTreasuryAccountId(operatorId)
     .setTokenType(TokenType.FungibleCommon)
     .setSupplyType(TokenSupplyType.Infinite)
-    // no KYC key -> simpler UX for quote currency
     .setAdminKey(operatorKey.publicKey)
     .setSupplyKey(operatorKey.publicKey)
     .setFreezeDefault(false)
@@ -40,5 +39,5 @@ const {
       ? tokenId.toEvmAddress()
       : "0x" + tokenId.toEvmAddress();
 
-  console.log(`USDC HTS created -> tokenId=${tokenId.toString()} evm=${evm}`);
-})();
+  console.log(`USDC xNG created -> tokenId=${tokenId.toString()} evm=${evm}`);
+})().catch(console.error);

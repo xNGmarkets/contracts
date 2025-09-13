@@ -10,23 +10,22 @@ const {
 } = require("@hashgraph/sdk");
 
 const TICKERS = [
-  "xNGX-MTNNG",
-  "xNGX-ZENITH",
+  "xNGX-MTNN",
+  "xNGX-UBA",
   "xNGX-GTCO",
-  "xNGX-OKOMUOIL",
+  "xNGX-ZENITHBANK",
+  "xNGX-ARADEL",
+  "xNGX-TOTALNG",
   "xNGX-AIICO",
+  "xNGX-CORNERST",
+  "xNGX-OKOMUOIL",
+  "xNGX-PRESCO",
+  "xNGX-NESTLE",
+  "xNGX-DANGSUGAR",
 ];
 
-function loadECDSAKey(str) {
-  if (str.startsWith("0x") || /^[0-9a-fA-F]{64}$/.test(str)) {
-    const hex = str.replace(/^0x/, "");
-    return PrivateKey.fromBytesECDSA(Buffer.from(hex, "hex"));
-  }
-  return PrivateKey.fromStringECDSA(str);
-}
-
 (async function main() {
-  const operatorKey = loadECDSAKey(process.env.OPERATOR_KEY);
+  const operatorKey = PrivateKey.fromStringECDSA(process.env.OPERATOR_KEY);
   const operatorId = AccountId.fromString(process.env.ACCOUNT_ID);
   const client = Client.forTestnet().setOperator(operatorId, operatorKey);
 
@@ -40,7 +39,7 @@ function loadECDSAKey(str) {
       .setTokenName(sym)
       .setTokenSymbol(sym)
       .setDecimals(6)
-      .setInitialSupply(0)
+      .setInitialSupply(1000 * 1e6) //MINT Intial supply for all stock
       .setTreasuryAccountId(operatorId)
       .setTokenType(TokenType.FungibleCommon)
       .setSupplyType(TokenSupplyType.Infinite)

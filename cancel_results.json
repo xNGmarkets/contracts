@@ -1,0 +1,21 @@
+{
+  "when": 1757775785968,
+  "results": {
+    "operator": [
+      {
+        "id": 75,
+        "hash": "0x31207e81c8c4393d1d73405e76e42954d97e1a7a3c6ec6b99fdf480e7d00b496",
+        "status": "OK"
+      }
+    ],
+    "user1": [
+      {
+        "id": 76,
+        "hash": "0xeb2f766d1896bc5f09a29cba7b57c8a34dc08f32d4baaf9ae379ccad6c7f172b",
+        "status": "OK"
+      }
+    ],
+    "user2": [],
+    "user3": []
+  }
+}
