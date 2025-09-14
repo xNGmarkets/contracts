@@ -32,49 +32,5 @@ OracleHub(verified) -> ContractId=0.0.6809934 evm=0xc51076c08596D3007DC4673bb8E6
 USDC xNG -> tokenId=0.0.6808751 evm=000000000000000000000000000000000067e4af
 DirectSettleAdapter(verified)  -> ContractId=0.0.6837050 evm=0x3698517eFDB3153f398fD33f86026B7c47cF9eFe
 Clob(verified)  -> ContractId=0.0.6837065 evm=0x4110d8CDae107aC2DD84550a14154D88dA9cFcB9
-```
-
-```
-//scripts/oracle_set_price.ts
-
-import { ethers } from "hardhat";
-
-async function main() {
-  const oracle = await ethers.getContractAt("OracleHub", process.env.ORACLE_HUB!);
-
-  // Example payload for xNGX-MTNN (use the *HTS token EVM address* as asset)
-  const asset = "0x...HTS_TOKEN_EVM_ADDRESS_FOR_MTNN...";
-  const priceE6 = Math.floor(282.45 * 1e6);
-  const seq = 1234;                 // strictly increasing per asset
-  const ts  = Math.floor(Date.now()/1000);
-  const hcsMsgId = "0x0000...";     // optional mirror reference
-
-  const tx = await oracle.setPrice(asset, { priceE6, seq, ts, hcsMsgId });
-  await tx.wait();
-  console.log("setPrice ok");
-}
-
-main().catch((e) => { console.error(e); process.exit(1); });
-```
-
-```
-//scripts/oracle_set_band.ts
-
-import { ethers } from "hardhat";
-
-async function main() {
-  const oracle = await ethers.getContractAt("OracleHub", process.env.ORACLE_HUB!);
-
-  // Example band for MTNN: mid=$282.45, width=±1.50%
-  const asset = "0x...HTS_TOKEN_EVM_ADDRESS_FOR_MTNN...";
-  const midE6 = Math.floor(282.45 * 1e6);
-  const widthBps = 150; // ±1.50%
-  const ts = Math.floor(Date.now()/1000);
-
-  const tx = await oracle.setBand(asset, { midE6, widthBps, ts });
-  await tx.wait();
-  console.log("setBand ok");
-}
-
-main().catch((e) => { console.error(e); process.exit(1); });
+BorrowSupply(verified) -> ContractId=0.0.6837722 evm=0x9B432bd81385b41e9a66cb133e6751dd7af44d65
 ```

@@ -1,4 +1,2 @@
-Unknown command: "hardhat"
+[dotenv@17.2.2] injecting env (41) from .env -- tip: ⚙️  write to custom object with { processEnv: myObject }
 
-To see a list of supported npm commands, run:
-  npm help
