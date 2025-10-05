@@ -34,5 +34,5 @@ OracleHub(verified) -> ContractId=0.0.6809934 evm=0xc51076c08596D3007DC4673bb8E6
 USDC xNG -> tokenId=0.0.6808751 evm=000000000000000000000000000000000067e4af
 DirectSettleAdapter(verified)  -> ContractId=0.0.6837050 evm=0x3698517eFDB3153f398fD33f86026B7c47cF9eFe
 Clob(verified)  -> ContractId=0.0.6955617 evm=0x7ad55622F26EEEdeb312f4b135F7076DFb1938Bd
-BorrowSupply(verified) -> ContractId=0.0.6837722 evm=0x9B432bd81385b41e9a66cb133e6751dd7af44d65
+BorrowSupply(verified) -> ContractId=0.0.6955987 evm=0x461D8b986d3B1e3559d22155872eb0815355644b
 ```

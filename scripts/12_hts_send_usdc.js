@@ -27,22 +27,14 @@ const {
     const operatorKey = PrivateKey.fromStringECDSA(process.env.OPERATOR_KEY);
     const client = Client.forTestnet().setOperator(operatorId, operatorKey);
 
-    console.log(
-      AccountId.fromEvmAddress(
-        0,
-        0,
-        "9F964940Dd48a2b4b0328490E1b4059ec45cd622"
-      ).toString()
-    );
-    return;
     // Token & accounts
-    const tokenId = TokenId.fromString(process.env.USDC_CONTRACT_ID);
+    const tokenId = TokenId.fromString(process.env.AIICO_CONTRACT_ID);
 
     const USERS = [
-      // process.env.USER_1_ACCOUNT_ID,
+      process.env.USER_1_ACCOUNT_ID,
       // process.env.USER_2_ACCOUNT_ID,
       // process.env.USER_3_ACCOUNT_ID,
-      "0.0.6734752",
+      // "0.0.6734752",
     ].filter(Boolean);
 
     // if (USERS.length !== 3) {
@@ -51,11 +43,11 @@ const {
 
     // Amount: 100,000 USDC with 6 decimals = 100,000 * 1,000,000 = 100,000,000,000
     // Use Number (safe here) — NOT BigInt — for @hashgraph/sdk transfer amounts
-    const amountUnits = 1000 * 1000000; // Number(1e11) — within JS safe integer
+    const amountUnits = 500 * 1000000; // Number(1e11) — within JS safe integer
 
     // Build a single multi-party TransferTransaction
     let tx = new TransferTransaction()
-      .setTransactionMemo("Airdrop USDC to users")
+      .setTransactionMemo("Airdrop Token to users")
       .setMaxTransactionFee(new Hbar(5));
 
     // Debit the treasury once per user (and credit each user)
