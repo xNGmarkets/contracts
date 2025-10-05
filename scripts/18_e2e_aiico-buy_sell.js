@@ -1,7 +1,7 @@
 // scripts/e2e_aiico_cross.js
 // One-shot test: Operator sells 100 AIICO, User1 buys, then matchBest.
 //
-// Env needed (you already have these):
+// Env needed:
 //  RPC_URL=https://testnet.hashio.io/api
 //  CHAIN_ID=296
 //  CLOB_CONTRACT=0x...
@@ -10,18 +10,19 @@
 //  USDC_CONTRACT=0x000000000000000000000000000000000067e4af
 //  USDC_CONTRACT_ID=0.0.6808751
 //  AIICO=0x000000000000000000000000000000000067de98
+//  FX_ASSET=0x00000000000000000000000000000000xxxxxxxx   // OracleHub asset: midE6 = NGN per 1 USD
 //
 //  ACCOUNT_ID=0.0.6781385
-//  ACCOUNT_EVM=0x2015f2fcd836fa590ea66291453a287a5e23c8dc     (Operator)
-//  OPERATOR_PRIVATE_KEY=0x61de4b0e...3f3e224                     (hex, with or without 0x OK)
+//  ACCOUNT_EVM=0x2015f2fcd836fa590ea66291453a287a5e23c8dc
+//  OPERATOR_PRIVATE_KEY=0x....
 //
 //  USER_1_ACCOUNT_ID=0.0.6834746
 //  USER_1_EVM=0x1c23de7...9A5676B
-//  USER_1_PRIVATE_KEY=ac004ce7...c3fc4ec                         (raw hex ok)
+//  USER_1_PRIVATE_KEY=ac004ce7...c3fc4ec
 //
 //  FEE_SINK_ACCOUNT_ID=0.0.6834752
 //  FEE_SINK_EVM=0xC70525cC7D0491102A259DCc702F45dc8Fae204d
-//  FEE_SINK_KEY=e2d9fd24...76b77764                               (raw hex ok)
+//  FEE_SINK_KEY=e2d9fd24...76b77764
 
 require("dotenv").config();
 const { ethers } = require("ethers");
@@ -46,12 +47,23 @@ const ORACLE_ABI = [
   "function getBand(address asset) view returns (uint128 midE6, uint16 widthBps, uint64 ts)",
 ];
 
+// const CLOB_ABI = [
+//   "function feeBps(address asset) view returns (uint16)",
+//   "function bandRange(address asset) view returns (uint256 lo, uint256 hi, uint64 ts)",
+//   "function place(address asset, uint8 side, bool isMarket, uint128 qty, uint128 pxE6) returns (uint256)",
+//   "function matchBest(address asset, uint256 maxMatches)",
+//   "event OrderPlaced(uint256 id, address indexed trader, address indexed asset, uint8 side, bool isMarket, uint128 qty, uint128 pxE6)",
+//   "event Trade(address indexed asset, uint256 buyId, uint256 sellId, address buyer, address seller, uint128 qty, uint128 pxE6, uint128 notionalE6, uint128 feeE6)",
+// ];
+
 const CLOB_ABI = [
-  "function feeBps() view returns (uint16)",
+  "function feeBps(address asset) view returns (uint16)",
+  "function bandRange(address asset) view returns (uint256 lo, uint256 hi, uint64 ts)",
   "function place(address asset, uint8 side, bool isMarket, uint128 qty, uint128 pxE6) returns (uint256)",
-  "function matchBest(address asset, uint256 maxMatches) external",
-  "event Placed(uint256 indexed id, address indexed asset, address indexed trader, uint8 side, bool isMarket, uint128 qty, uint128 pxE6)",
-  "event Trade(address indexed asset, uint256 indexed buyId, uint256 indexed sellId, address buyer, address seller, uint128 qty, uint128 pxE6, uint256 notionalE6, uint256 feeE6)",
+  "function matchBest(address asset, uint256 maxMatches)",
+  // events
+  "event OrderPlaced(uint256 id, address indexed trader, address indexed asset, uint8 side, bool isMarket, uint128 qty, uint128 pxE6)",
+  "event Trade(address indexed asset, address indexed buyer, address indexed seller, uint256 buyId, uint256 sellId, uint128 qty, uint128 pxE6, uint128 notionalE6, uint128 feeE6)",
 ];
 
 // ===== Env & addresses =====
@@ -67,9 +79,11 @@ const ADDR = {
   USDC: process.env.USDC_CONTRACT,
   USDC_ID: process.env.USDC_CONTRACT_ID,
   AIICO: process.env.AIICO,
+  FX_ASSET: process.env.FX_ASSET, // Used only for logging NGN equivalents
 };
-for (const [k, v] of Object.entries(ADDR))
-  if (!v) throw new Error(`Missing env: ${k}`);
+for (const [k, v] of Object.entries(ADDR)) {
+  if (!v && !["FX_ASSET"].includes(k)) throw new Error(`Missing env: ${k}`);
+}
 
 const OP = {
   ID: process.env.ACCOUNT_ID,
@@ -94,7 +108,7 @@ if (!OP.ID || !OP.KEY) throw new Error("Missing operator account env");
 if (!U1.ID || !U1.KEY) throw new Error("Missing USER_1 account env");
 if (!SINK.ID || !SINK.KEY) throw new Error("Missing FEE_SINK env");
 
-console.log(OP, U1);
+console.log({ OP: OP.ID, U1: U1.ID, SINK: SINK.ID });
 
 // ===== Helpers =====
 const ONE_E6 = 1_000_000n;
@@ -118,8 +132,6 @@ async function associate(accountIdStr, privHex, tokenIds) {
   const tx = new TokenAssociateTransaction()
     .setAccountId(accountId)
     .setTokenIds(uniq);
-
-  // IMPORTANT: don't chain .sign(...).execute(). Await sign first (it returns a Promise)
   await tx.freezeWith(client);
   const signed = await tx.sign(key);
   const resp = await signed.execute(client);
@@ -171,25 +183,12 @@ async function ensureAssociated() {
   }
 }
 
-async function ensureAllowance(token, ownerWallet, spender, minAmount, label) {
+async function ensureAllowance(token, ownerWallet, spender, _minAmount, label) {
   const t = token.connect(ownerWallet);
-  const current = await t.allowance(ownerWallet.address, spender);
-  // if (current >= minAmount) {
-  //   console.log(`  • ${label} allowance OK (${current.toString()})`);
-  //   return;
-  // }
-  // Some ERC20s require zero-first
   try {
-    // console.log("current", current);
-    // if (current > 0n) {
-    //   console.log(`  • Reset ${label} allowance → 0`);
-    //   const tx0 = await t.approve(spender, 0n);
-    //   await tx0.wait();
-    // }
-    const _approve = 1000000 * 10 ** 6; //Lets use 1M default approval
-    console.log(`  • Approve ${label} → ${_approve.toString()}`);
-    console.log("Spender", spender);
-    const tx = await t.approve(spender, _approve); //minAmount
+    const APPROVE = 1_000_000 * 10 ** 6; // approve 1M (6dp) for simplicity
+    console.log(`  • Approve ${label} → ${APPROVE.toString()}`);
+    const tx = await t.approve(spender, APPROVE);
     await tx.wait();
   } catch (e) {
     console.error(`  ✗ approve(${label}) failed:`, e);
@@ -202,6 +201,9 @@ function fmt6(n) {
 }
 function fmtUSD(nE6) {
   return `$${(Number(nE6) / 1e6).toFixed(6)}`;
+}
+function fmtNGN(nE6) {
+  return `₦${(Number(nE6) / 1e6).toFixed(6)}`;
 }
 
 (async () => {
@@ -218,31 +220,64 @@ function fmtUSD(nE6) {
   const clob = new ethers.Contract(ADDR.CLOB, CLOB_ABI, provider);
   const oracle = new ethers.Contract(ADDR.ORACLE, ORACLE_ABI, provider);
 
-  const [usdcDec, aiicoDec] = await Promise.all([
+  const [usdcDecRaw, aiicoDecRaw] = await Promise.all([
     usdc.decimals(),
     aiico.decimals(),
   ]);
+  const usdcDec = Number(usdcDecRaw); // <-- cast to Number
+  const aiicoDec = Number(aiicoDecRaw); // <-- cast to Number
   if (usdcDec !== 6)
     console.warn(`WARN: USDC decimals reported ${usdcDec}, expected 6`);
   if (aiicoDec !== 6)
     console.warn(`WARN: AIICO decimals reported ${aiicoDec}, expected 6`);
 
-  // Read band for price & freshness
-  const { midE6, widthBps, ts } = await oracle.getBand(ADDR.AIICO);
+  // Read equity band (NGN) and FX (NGN per USD) for dual-currency logging
+  const equity = await oracle.getBand(ADDR.AIICO);
   const maxStale = await oracle.maxStaleness();
   const now = Math.floor(Date.now() / 1000);
-  const fresh = now <= Number(ts) + Number(maxStale);
+
+  let fx = null;
+  if (ADDR.FX_ASSET) {
+    fx = await oracle.getBand(ADDR.FX_ASSET);
+  } else {
+    console.warn("WARN: FX_ASSET not set — NGN logging will be skipped.");
+  }
+
+  console.log({
+    now,
+    equity_ts: equity.ts,
+    maxStale,
+  });
+  const freshEquity = now <= Number(equity.ts) + Number(maxStale);
+  const freshFx = fx ? now <= Number(fx.ts) + Number(maxStale) : true;
+
+  console.log(freshEquity, freshFx);
+  // Convert mid NGN → USD for display (usd = ngn * 1e6 / fxMidE6)
+  const pxUsdE6 = fx
+    ? (BigInt(equity.midE6) * 1_000_000n) / BigInt(fx.midE6)
+    : BigInt(equity.midE6); // fallback (USD==NGN for logs only)
+
   console.log(`\nVenue & band …`);
   console.log(
-    `  • AIICO mid = $${(Number(midE6) / 1e6).toFixed(
-      6
-    )} | widthBps=${widthBps} | fresh ${fresh ? "✓" : "✗"}`
+    `  • AIICO mid: USD ${fmtUSD(pxUsdE6)} ${
+      fx ? `(NGN ${fmtNGN(equity.midE6)})` : ""
+    } | widthBps=${equity.widthBps} | fresh eq:${freshEquity ? "✓" : "✗"} fx:${
+      freshFx ? "✓" : "✗"
+    }`
   );
-  if (!fresh) {
+  if (!freshEquity || !freshFx) {
     console.log(
-      "  • Band is stale — this would block matching; update oracle first."
+      "  • Band/FX is stale — this would block matching; update oracle first."
     );
     process.exit(1);
+  }
+
+  // Also show CLOB’s USD band (proves conversion is live inside contract)
+  try {
+    const [lo, hi] = await clob.bandRange(ADDR.AIICO);
+    console.log(`  • CLOB USD band: [${fmtUSD(lo)} .. ${fmtUSD(hi)}]`);
+  } catch {
+    console.log("  • bandRange view not available on this deployment (ok).");
   }
 
   // Balances before
@@ -252,21 +287,52 @@ function fmtUSD(nE6) {
     usdc.balanceOf(wU1.address),
     aiico.balanceOf(wU1.address),
   ]);
-  console.log(`Pre balances:`);
+  console.log(`\nPre balances:`);
   console.log(`  • Operator USDC=${fmt6(opUSD0)}  AIICO=${fmt6(opAII0)}`);
   console.log(`  • User1    USDC=${fmt6(u1USD0)}  AIICO=${fmt6(u1AII0)}`);
 
   // Parameters
-  const qtyE6 = 100n * ONE_E6; // 100 AIICO (6dp)
-  const pxE6 = BigInt(midE6); // use mid; guaranteed inside band
+  const qtyE6 = 100n * ONE_E6; // 100 AIICO
+  const pxE6 = BigInt(pxUsdE6); // USD px (inside band)
   const notionalE6 = (qtyE6 * pxE6) / ONE_E6;
 
-  const feeBps = BigInt(await clob.feeBps()); // e.g. 20
+  let feeBps = 0n;
+  try {
+    feeBps = BigInt(await clob.feeBps(ADDR.AIICO));
+  } catch {
+    console.warn("  • feeBps(asset) view failed; defaulting to 0 bps");
+    feeBps = 0n;
+  }
   const feeE6 = (notionalE6 * feeBps) / 10000n;
   const needUSDC = notionalE6 + feeE6;
 
+  // NGN equivalents for logging
+  const pxNgnE6 = fx ? (pxE6 * BigInt(fx.midE6)) / 1_000_000n : null; // USD→NGN
+  const notionalNgnE6 = fx
+    ? (notionalE6 * BigInt(fx.midE6)) / 1_000_000n
+    : null;
+  const feeNgnE6 = fx ? (feeE6 * BigInt(fx.midE6)) / 1_000_000n : null;
+
+  console.log(`\nOrder preview …`);
+  console.log(
+    `  • SELL qty=${fmt6(qtyE6)} @ ${fmtUSD(pxE6)} ${
+      pxNgnE6 ? `(≈ ${fmtNGN(pxNgnE6)})` : ""
+    }`
+  );
+  console.log(
+    `  • BUY  qty=${fmt6(qtyE6)} @ ${fmtUSD(pxE6)} ${
+      pxNgnE6 ? `(≈ ${fmtNGN(pxNgnE6)})` : ""
+    }`
+  );
+  console.log(
+    `  • Notional: ${fmtUSD(notionalE6)} ${
+      notionalNgnE6 ? `(≈ ${fmtNGN(notionalNgnE6)})` : ""
+    } | Fee (${feeBps} bps): ${fmtUSD(feeE6)} ${
+      feeNgnE6 ? `(≈ ${fmtNGN(feeNgnE6)})` : ""
+    }`
+  );
+
   console.log(`\nAllowances …`);
-  // Buyer (User1) must approve USDC to adapter for notional + fee
   await ensureAllowance(
     usdc,
     wU1,
@@ -274,7 +340,6 @@ function fmtUSD(nE6) {
     needUSDC,
     "USDC (User1 → Adapter)"
   );
-  // Seller (Operator) must approve AIICO to adapter for qty
   await ensureAllowance(
     aiico,
     wOp,
@@ -283,17 +348,19 @@ function fmtUSD(nE6) {
     "AIICO (Operator → Adapter)"
   );
 
-  // return;
-
   // Events
   const iface = new ethers.Interface(CLOB_ABI);
-  const placedTopic = iface.getEvent("Placed").topicHash;
+  const placedTopic = iface.getEvent("OrderPlaced").topicHash;
   const tradeTopic = iface.getEvent("Trade").topicHash;
   const startBlock = await provider.getBlockNumber();
 
   // 1) Operator places SELL
   console.log(`\nPlacing orders …`);
-  console.log(`  • Operator SELL qty=${fmt6(qtyE6)} @ ${fmtUSD(pxE6)}`);
+  console.log(
+    `  • Operator SELL qty=${fmt6(qtyE6)} @ ${fmtUSD(pxE6)} ${
+      pxNgnE6 ? `(≈ ${fmtNGN(pxNgnE6)})` : ""
+    }`
+  );
   const txS = await clob
     .connect(wOp)
     .place(ADDR.AIICO, SIDE.Sell, false, qtyE6, pxE6);
@@ -309,8 +376,12 @@ function fmtUSD(nE6) {
     `    - place tx: ${rcS.hash}${sellId ? ` (sellId=${sellId})` : ""}`
   );
 
-  // 2) User1 places BUY at same qty/price
-  console.log(`  • User1 BUY   qty=${fmt6(qtyE6)} @ ${fmtUSD(pxE6)}`);
+  // 2) User1 places BUY
+  console.log(
+    `  • User1 BUY   qty=${fmt6(qtyE6)} @ ${fmtUSD(pxE6)} ${
+      pxNgnE6 ? `(≈ ${fmtNGN(pxNgnE6)})` : ""
+    }`
+  );
   const txB = await clob
     .connect(wU1)
     .place(ADDR.AIICO, SIDE.Buy, false, qtyE6, pxE6);
@@ -331,12 +402,10 @@ function fmtUSD(nE6) {
     const rcM = await txM.wait();
     console.log(`  • matchBest tx: ${rcM.hash}`);
   } catch (e) {
-    console.log(e);
-    // If anything fails here, it is almost always association/KYC/allowance/venue/band
     console.error("  ✗ matchBest failed:", e?.reason || e?.message || e);
   }
 
-  // 4) Scan for trades
+  // 4) Scan for trades + log in USD & NGN
   const endBlock = await provider.getBlockNumber();
   const logs = await provider.getLogs({
     address: ADDR.CLOB,
@@ -346,7 +415,7 @@ function fmtUSD(nE6) {
   });
   if (logs.length === 0) {
     console.log(
-      "  • No Trade events found (check band freshness, venue=Continuous, and allowances)."
+      "  • No Trade events found (check band freshness, venue=Continuous, FX set, and allowances)."
     );
   } else {
     for (const lg of logs) {
@@ -362,10 +431,21 @@ function fmtUSD(nE6) {
         notionalE6: nE6,
         feeE6: fE6,
       } = ev.args;
+
+      // NGN equivalents for executed trade
+      const pNgnE6 = fx ? (BigInt(pE6) * BigInt(fx.midE6)) / 1_000_000n : null;
+      const nNgnE6 = fx ? (BigInt(nE6) * BigInt(fx.midE6)) / 1_000_000n : null;
+      const fNgnE6 = fx ? (BigInt(fE6) * BigInt(fx.midE6)) / 1_000_000n : null;
+
       console.log(
-        `  • TRADE asset=${asset} buyId=${bId} sellId=${sId} buyer=${buyer} seller=${seller} qty=${fmt6(
-          qty
-        )} px=${fmtUSD(pE6)} notional=${fmtUSD(nE6)} fee=${fmtUSD(fE6)}`
+        `  • TRADE asset=${asset} buyId=${bId} sellId=${sId}\n` +
+          `      buyer=${buyer} seller=${seller}\n` +
+          `      qty=${fmt6(qty)} px=${fmtUSD(pE6)}${
+            pNgnE6 ? ` (≈ ${fmtNGN(pNgnE6)})` : ""
+          }\n` +
+          `      notional=${fmtUSD(nE6)}${
+            nNgnE6 ? ` (≈ ${fmtNGN(nNgnE6)})` : ""
+          } fee=${fmtUSD(fE6)}${fNgnE6 ? ` (≈ ${fmtNGN(fNgnE6)})` : ""}`
       );
     }
   }

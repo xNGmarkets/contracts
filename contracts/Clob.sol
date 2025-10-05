@@ -10,21 +10,17 @@ pragma solidity ^0.8.20;
  *  - On Hedera HTS via EVM addresses: users (and the fee sink) must be associated (and KYC’d if enforced).
  *
  * **Invariants & Units**
- *  - USDC and all xNGX tokens use 6 decimals (1 token = 1e6 base units)
+ *  - USDC and all xNGX tokens use 6 decimals (1e6)
  *  - Prices are in USD * 1e6 (pxE6). Example: $4.17 → 4_170_000
  *  - Quantities (qty) are in asset base units (1e6). Example: 100 tokens → 100_000_000
- *  - **Notional is computed as (qty * pxE6) / 1e6** to keep result in USD * 1e6
- *  - Fees are taken in USDC (quote), not from asset quantity
- *
- * Notes:
- *  - Band enforced at entry AND at match time; stale oracle halts matching.
+ *  - Notional = (qty * pxE6) / 1e6  → USD * 1e6
  */
 
 import {IOracleHub} from "./interfaces/IOracleHub.sol";
 import {IMoveAdapter} from "./interfaces/IMoveAdapter.sol";
 
 contract Clob {
-    // ============ Types ============
+    // ========= Types =========
     enum VenueState {
         Paused,
         Continuous,
@@ -36,8 +32,8 @@ contract Clob {
     }
 
     struct Order {
-        address trader; // EOA placing the order
-        address asset; // xNGX token (HTS EVM address ok)
+        address trader; // msg.sender
+        address asset; // xNGX token
         Side side; // buy or sell
         bool isMarket; // market vs limit
         uint128 qty; // asset units (6 dp)
@@ -51,64 +47,67 @@ contract Clob {
         uint128 askE6;
     }
 
-    // ============ Storage ============
+    // ========= Storage =========
     address public owner;
     address public immutable USDC; // quote token (6 dp)
     IOracleHub public oracle;
     IMoveAdapter public adapter;
     address public feeSink; // receives fees in USDC
-    uint16 public feeBps = 20; // 0.20% (20 bps)
 
-    mapping(address => VenueState) public venue; // per-asset venue state
-    mapping(address => uint256[]) public bids; // asset => orderIds
-    mapping(address => uint256[]) public asks; // asset => orderIds
-    Order[] public orders; // orderId = index
+    // NEW: FX asset (OracleHub asset that carries NGN per USD, scaled 1e6)
+    address public fxAsset;
+    event FxAssetSet(address fxAsset);
 
-    // Reentrancy guard (simple)
-    uint256 private _lock = 1;
-    modifier nonReentrant() {
-        require(_lock == 1, "reentrancy");
-        _lock = 2;
-        _;
-        _lock = 1;
-    }
+    // per-asset config
+    mapping(address => uint16) public feeBps; // 1 = 1bp
+    mapping(address => VenueState) public venue;
 
-    // ============ Events ============
-    event Placed(
-        uint256 indexed id,
-        address indexed asset,
+    // order book
+    Order[] public orders;
+    mapping(address => uint256[]) public bids; // order ids (may include inactive; filter on read)
+    mapping(address => uint256[]) public asks; // order ids (may include inactive; filter on read)
+
+    // events
+    event OwnerTransferred(address indexed newOwner);
+    event VenueSet(address indexed asset, VenueState state);
+    event FeeSinkSet(address indexed sink);
+    event FeeBpsSet(address indexed asset, uint16 feeBps);
+    event OrderPlaced(
+        uint256 id,
         address indexed trader,
+        address indexed asset,
         Side side,
         bool isMarket,
         uint128 qty,
         uint128 pxE6
     );
-    event Cancelled(uint256 indexed id);
+    event OrderCanceled(uint256 id, address indexed trader);
     event Trade(
         address indexed asset,
-        uint256 indexed buyId,
-        uint256 indexed sellId,
-        address buyer,
-        address seller,
+        uint256 buyId,
+        uint256 sellId,
+        address indexed buyer,
+        address indexed seller,
         uint128 qty,
         uint128 pxE6,
-        uint256 notionalE6,
-        uint256 feeE6
+        uint128 notionalE6,
+        uint128 feeE6
     );
-    event VenueSet(address indexed asset, VenueState state);
-    event FeeSinkSet(address sink);
-    event FeeBpsSet(uint16 bps);
-    event OracleSet(address oracle);
-    event AdapterSet(address adapter);
-    event OwnerTransferred(address indexed newOwner);
 
-    // ============ Modifiers ============
+    // ========= Reentrancy guard / Modifiers =========
+    uint256 private _status = 1;
+    modifier nonReentrant() {
+        require(_status == 1, "reentrant");
+        _status = 2;
+        _;
+        _status = 1;
+    }
     modifier onlyOwner() {
         require(msg.sender == owner, "only owner");
         _;
     }
 
-    // ============ Constructor ============
+    // ========= Constructor =========
     constructor(
         address _owner,
         address _oracle,
@@ -131,7 +130,7 @@ contract Clob {
         feeSink = _feeSink;
     }
 
-    // ============ Admin ============
+    // ========= Admin =========
     function setVenue(address asset, VenueState state) external onlyOwner {
         venue[asset] = state;
         emit VenueSet(asset, state);
@@ -143,22 +142,10 @@ contract Clob {
         emit FeeSinkSet(sink);
     }
 
-    function setFeeBps(uint16 bps) external onlyOwner {
-        require(bps <= 1000, "fee too high"); // cap at 10%
-        feeBps = bps;
-        emit FeeBpsSet(bps);
-    }
-
-    function setOracle(address o) external onlyOwner {
-        require(o != address(0), "zero");
-        oracle = IOracleHub(o);
-        emit OracleSet(o);
-    }
-
-    function setAdapter(address a) external onlyOwner {
-        require(a != address(0), "zero");
-        adapter = IMoveAdapter(a);
-        emit AdapterSet(a);
+    function setFeeBps(address asset, uint16 bps) external onlyOwner {
+        require(bps <= 1000, "fee>10%");
+        feeBps[asset] = bps;
+        emit FeeBpsSet(asset, bps);
     }
 
     function transferOwnership(address newOwner) external onlyOwner {
@@ -167,48 +154,269 @@ contract Clob {
         emit OwnerTransferred(newOwner);
     }
 
-    // ============ Views ============
+    /// @notice NEW: set FX asset used for NGN→USD conversion via OracleHub
+    function setFxAsset(address _fxAsset) external onlyOwner {
+        require(_fxAsset != address(0), "fx:zero");
+        fxAsset = _fxAsset;
+        emit FxAssetSet(_fxAsset);
+    }
+
+    // ========= Views / Helpers =========
     function ordersLength() external view returns (uint256) {
         return orders.length;
     }
 
-    /// @notice Returns current band range for an asset using oracle mid/width
+    // --- NGN→USD conversion using FX asset from OracleHub (NEW) ---
+    /// @dev Convert NGN (e6) to USD (e6) using NGN per USD (e6)
+    function _toUsdE6(
+        uint256 ngnPxE6,
+        uint256 ngnPerUsdE6
+    ) internal pure returns (uint256) {
+        // usd = ngn * 1e6 / (ngn per usd)
+        return (ngnPxE6 * 1_000_000) / ngnPerUsdE6;
+    }
+
+    /// @notice NEW: Read equity band (NGN) + FX, return USD band
+    function _freshBandUSD(
+        address asset
+    ) internal view returns (uint256 loUsdE6, uint256 hiUsdE6, uint64 ts) {
+        IOracleHub.BandPayload memory b = oracle.getBand(asset);
+        require(b.midE6 > 0, "no band");
+        uint64 maxS = oracle.maxStaleness();
+        require(
+            block.timestamp <= uint256(b.ts) + uint256(maxS),
+            "stale/oracle"
+        );
+
+        // FX as an OracleHub asset: midE6 = NGN per 1 USD (e6)
+        IOracleHub.BandPayload memory fxB = oracle.getBand(fxAsset);
+        require(fxB.midE6 > 0, "no fx");
+        require(block.timestamp <= uint256(fxB.ts) + uint256(maxS), "stale/fx");
+
+        uint256 midUsdE6 = _toUsdE6(uint256(b.midE6), uint256(fxB.midE6));
+        uint256 delta = (midUsdE6 * uint256(b.widthBps)) / 10_000; // keep equity width
+        loUsdE6 = midUsdE6 - delta;
+        hiUsdE6 = midUsdE6 + delta;
+        ts = b.ts <= fxB.ts ? b.ts : fxB.ts; // effective "as-of"
+    }
+
+    /// @notice CHANGED: band returned in USD after NGN→USD conversion
     function bandRange(
         address asset
     ) public view returns (uint256 lo, uint256 hi, uint64 ts) {
-        IOracleHub.BandPayload memory b = oracle.getBand(asset);
-        require(b.midE6 > 0, "no band");
-        uint256 delta = (uint256(b.midE6) * uint256(b.widthBps)) / 10000; // bps
-        lo = b.midE6 - delta;
-        hi = b.midE6 + delta;
-        ts = b.ts;
+        require(fxAsset != address(0), "fx:not set");
+        (lo, hi, ts) = _freshBandUSD(asset);
     }
 
-    /// @dev Oracle freshness guard
+    /// @dev Oracle freshness guard (equity band only; FX checked in _freshBandUSD)
     function isFresh(uint64 ts) public view returns (bool) {
         uint64 maxS = oracle.maxStaleness();
         return (block.timestamp <= uint256(ts) + uint256(maxS));
     }
 
-    /// @notice Best bid/ask snapshot by linear scan (sufficient for MVP)
-    function best(address asset) external view returns (BestPx memory bp) {
+    // Best-of-book (derived from open orders)
+    function best(address asset) public view returns (BestPx memory) {
+        BestPx memory bp;
         uint256[] storage B = bids[asset];
         uint256[] storage A = asks[asset];
-        uint128 bestBid;
-        uint128 bestAsk;
+
         for (uint256 i = 0; i < B.length; i++) {
             Order storage o = orders[B[i]];
-            if (o.active && o.pxE6 > bestBid) bestBid = o.pxE6;
+            if (!o.active || o.asset != asset || o.side != Side.Buy) continue;
+            if (o.pxE6 > bp.bidE6) bp.bidE6 = o.pxE6;
         }
         for (uint256 j = 0; j < A.length; j++) {
-            Order storage o = orders[A[j]];
-            if (o.active && (bestAsk == 0 || o.pxE6 < bestAsk))
-                bestAsk = o.pxE6;
+            Order storage o2 = orders[A[j]];
+            if (!o2.active || o2.asset != asset || o2.side != Side.Sell)
+                continue;
+            if (bp.askE6 == 0 || o2.pxE6 < bp.askE6) bp.askE6 = o2.pxE6;
         }
-        bp = BestPx(bestBid, bestAsk);
+        return bp;
     }
 
-    // ============ Order entry ============
+    /// IDs only (kept for compatibility)
+    function ordersOf(
+        address asset,
+        bool isBids
+    ) external view returns (uint256[] memory) {
+        return isBids ? bids[asset] : asks[asset];
+    }
+
+    // ======= Rich read helpers for UIs (NEW) =======
+    /// @notice Return the full order struct for a given id (copy from storage)
+    function getOrder(uint256 id) external view returns (Order memory o) {
+        o = orders[id];
+    }
+
+    /// @notice Return ACTIVE bids and asks (structs) for a given asset
+    function getOrderBook(
+        address asset
+    )
+        external
+        view
+        returns (Order[] memory bidOrders, Order[] memory askOrders)
+    {
+        // count actives first (so we can allocate tight arrays)
+        uint256 bc;
+        uint256 ac;
+        uint256[] storage B = bids[asset];
+        uint256[] storage A = asks[asset];
+
+        for (uint256 i = 0; i < B.length; i++) {
+            Order storage o = orders[B[i]];
+            if (o.active && o.asset == asset && o.side == Side.Buy) bc++;
+        }
+        for (uint256 j = 0; j < A.length; j++) {
+            Order storage o2 = orders[A[j]];
+            if (o2.active && o2.asset == asset && o2.side == Side.Sell) ac++;
+        }
+
+        bidOrders = new Order[](bc);
+        askOrders = new Order[](ac);
+
+        uint256 bi;
+        uint256 ai;
+        for (uint256 i2 = 0; i2 < B.length; i2++) {
+            Order storage ob = orders[B[i2]];
+            if (ob.active && ob.asset == asset && ob.side == Side.Buy) {
+                bidOrders[bi++] = ob;
+            }
+        }
+        for (uint256 j2 = 0; j2 < A.length; j2++) {
+            Order storage oa = orders[A[j2]];
+            if (oa.active && oa.asset == asset && oa.side == Side.Sell) {
+                askOrders[ai++] = oa;
+            }
+        }
+    }
+
+    /// @notice Return all ACTIVE open orders for a user (ids + structs)
+    function getOpenOrders(
+        address user
+    ) external view returns (uint256[] memory ids, Order[] memory os) {
+        // first pass: count
+        uint256 cnt;
+        for (uint256 i = 0; i < orders.length; i++) {
+            Order storage o = orders[i];
+            if (o.active && o.trader == user) cnt++;
+        }
+        ids = new uint256[](cnt);
+        os = new Order[](cnt);
+
+        // second pass: fill
+        uint256 k;
+        for (uint256 i2 = 0; i2 < orders.length; i2++) {
+            Order storage o2 = orders[i2];
+            if (o2.active && o2.trader == user) {
+                ids[k] = i2;
+                os[k] = o2;
+                k++;
+            }
+        }
+    }
+
+    // ======= PAGINATION =======
+    /**
+     * @notice Page through an asset’s order book *one side at a time*.
+     * @param asset   xNGX token
+     * @param side    0 = Buy, 1 = Sell
+     * @param cursor  Array index cursor into bids[asset] or asks[asset] (not orderId)
+     * @param limit   Max number of active orders to return (defaults to 50 if 0)
+     * @return ordersOut Active orders (struct copies)
+     * @return nextCursor Next array index to continue from (== length when exhausted)
+     */
+    function getOrderBookPage(
+        address asset,
+        uint8 side,
+        uint256 cursor,
+        uint256 limit
+    ) external view returns (Order[] memory ordersOut, uint256 nextCursor) {
+        require(side <= 1, "side");
+        uint256[] storage arr = (side == 0) ? bids[asset] : asks[asset];
+        uint256 n = arr.length;
+        if (cursor > n) cursor = n;
+        if (limit == 0) limit = 50;
+
+        // count up to 'limit'
+        uint256 count;
+        uint256 i = cursor;
+        while (i < n && count < limit) {
+            Order storage o = orders[arr[i]];
+            if (o.active && o.asset == asset && uint8(o.side) == side) count++;
+            i++;
+        }
+
+        ordersOut = new Order[](count);
+
+        // fill
+        uint256 k;
+        i = cursor;
+        while (i < n && k < count) {
+            Order storage o2 = orders[arr[i]];
+            if (o2.active && o2.asset == asset && uint8(o2.side) == side) {
+                ordersOut[k++] = o2;
+            }
+            i++;
+        }
+
+        nextCursor = i;
+    }
+
+    /**
+     * @notice Page through all ACTIVE open orders for a user by scanning the global orders array.
+     * @param user     Trader address
+     * @param cursor   Starting orderId to scan from (0..orders.length)
+     * @param limit    Max number to return (defaults to 50 if 0)
+     * @return idsOut      Order IDs (active only)
+     * @return ordersOut   Order structs (active only)
+     * @return nextCursor  Next orderId to continue from (== length when exhausted)
+     */
+    function getOpenOrdersPage(
+        address user,
+        uint256 cursor,
+        uint256 limit
+    )
+        external
+        view
+        returns (
+            uint256[] memory idsOut,
+            Order[] memory ordersOut,
+            uint256 nextCursor
+        )
+    {
+        uint256 n = orders.length;
+        if (cursor > n) cursor = n;
+        if (limit == 0) limit = 50;
+
+        // count
+        uint256 count;
+        uint256 i = cursor;
+        while (i < n && count < limit) {
+            Order storage o = orders[i];
+            if (o.active && o.trader == user) count++;
+            i++;
+        }
+
+        idsOut = new uint256[](count);
+        ordersOut = new Order[](count);
+
+        // fill
+        uint256 k;
+        i = cursor;
+        while (i < n && k < count) {
+            Order storage o2 = orders[i];
+            if (o2.active && o2.trader == user) {
+                idsOut[k] = i;
+                ordersOut[k] = o2;
+                k++;
+            }
+            i++;
+        }
+
+        nextCursor = i;
+    }
+
+    // ========= Order entry =========
     function place(
         address asset,
         Side side,
@@ -244,7 +452,8 @@ contract Clob {
         } else {
             asks[asset].push(id);
         }
-        emit Placed(id, asset, msg.sender, side, isMarket, qty, pxE6);
+
+        emit OrderPlaced(id, msg.sender, asset, side, isMarket, qty, pxE6);
     }
 
     function cancel(uint256 id) external {
@@ -252,10 +461,10 @@ contract Clob {
         require(o.active, "inactive");
         require(o.trader == msg.sender, "not owner");
         o.active = false;
-        emit Cancelled(id);
+        emit OrderCanceled(id, o.trader);
     }
 
-    // ============ Matching ============
+    // ========= Matching =========
     function matchBest(
         address asset,
         uint256 maxMatches
@@ -279,7 +488,7 @@ contract Clob {
                 if (!sell.active) continue;
                 if (sell.asset != asset || buy.asset != asset) continue;
 
-                // Prevent self-trade
+                // block self-trade
                 if (buy.trader == sell.trader) continue;
 
                 uint128 execPxE6 = _executablePx(buy, sell);
@@ -293,27 +502,19 @@ contract Clob {
         }
     }
 
+    // crossing rule
     function _executablePx(
         Order storage buy,
         Order storage sell
-    ) internal view returns (uint128 pxE6) {
-        if (!buy.active || !sell.active) return 0;
-        if (buy.asset != sell.asset) return 0;
-
-        if (buy.isMarket && sell.isMarket) {
-            IOracleHub.BandPayload memory b = oracle.getBand(buy.asset);
-            return uint128(b.midE6);
-        }
-        if (buy.isMarket && !sell.isMarket) return sell.pxE6;
-        if (!buy.isMarket && sell.isMarket) return buy.pxE6;
-
-        if (buy.pxE6 >= sell.pxE6) {
-            // Maker price execution (older order sets price)
-            return (buy.ts >= sell.ts) ? sell.pxE6 : buy.pxE6;
-        }
-        return 0;
+    ) internal view returns (uint128) {
+        if (buy.isMarket && sell.isMarket) return 0;
+        if (buy.isMarket) return sell.pxE6;
+        if (sell.isMarket) return buy.pxE6;
+        if (buy.pxE6 < sell.pxE6) return 0; // not crossed
+        return sell.pxE6; // price-time: execute at resting (sell) price
     }
 
+    // settlement
     function _settleTrade(
         address asset,
         uint256 buyId,
@@ -323,26 +524,24 @@ contract Clob {
     ) internal {
         Order storage buy = orders[buyId];
         Order storage sell = orders[sellId];
-        require(buy.active && sell.active, "inactive");
-        require(qty > 0, "qty0");
 
-        // === Correct notional math ===
-        // qty and pxE6 are both scaled by 1e6, so divide by 1e6 to keep result in USD*1e6
-        uint256 notionalE6 = (uint256(qty) * uint256(pxE6)) / 1e6;
-        uint256 feeE6 = (notionalE6 * feeBps) / 10000; // bps
+        uint128 notionalE6 = uint128(
+            (uint256(qty) * uint256(pxE6)) / 1_000_000
+        );
+        uint16 fee = feeBps[asset];
+        uint128 feeE6 = uint128((uint256(notionalE6) * uint256(fee)) / 10_000);
 
-        // DIRECT-SETTLE (adapter only transferFroms; holds no balances)
-        //  - USDC from buyer → seller, and buyer → feeSink
-        adapter.move(USDC, buy.trader, sell.trader, notionalE6);
-        adapter.move(USDC, buy.trader, feeSink, feeE6);
+        // USDC: buyer→seller (net), buyer→feeSink (fee)
+        adapter.move(USDC, buy.trader, sell.trader, notionalE6 - feeE6);
+        if (feeE6 > 0) adapter.move(USDC, buy.trader, feeSink, feeE6);
 
-        //  - Asset from seller → buyer
+        // asset: seller→buyer
         adapter.move(asset, sell.trader, buy.trader, qty);
 
-        // Reduce open quantities / close if filled
+        // reduce/close
         buy.qty -= qty;
-        if (buy.qty == 0) buy.active = false;
         sell.qty -= qty;
+        if (buy.qty == 0) buy.active = false;
         if (sell.qty == 0) sell.active = false;
 
         emit Trade(

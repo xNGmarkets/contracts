@@ -18,6 +18,10 @@ async function main() {
   const deployedAddress = await clob.getAddress();
 
   console.log(deployedAddress);
+
+  const r = await clob.setFxAsset("0x00000000000000000000000000000000006a1e8c");
+
+  console.log(r);
 }
 
 main();

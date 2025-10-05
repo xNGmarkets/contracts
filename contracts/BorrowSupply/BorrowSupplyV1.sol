@@ -12,6 +12,10 @@ pragma solidity ^0.8.20;
  * - Supply APY = BorrowAPR * utilization * (1 - reserveFactor).
  * - Per-second interest accrual with global indices (borrowIndex, supplyIndex).
  * - Events for UI history. Portfolio views for lenders & borrowers.
+ *
+ * UPDATE (FX): OracleHub publishes equity prices in NGN (midE6). We now read an FX asset
+ * (e.g., xNG-NGN) from OracleHub with midE6 = NGN per 1 USD, then convert NGN→USD on the fly
+ * so all risk/accounting math remains in USD e6 (aligned with USDC).
  */
 
 import {IOracleHub} from "./../interfaces/IOracleHub.sol";
@@ -52,6 +56,10 @@ contract BorrowSupplyV1 {
     address public owner;
     IERC20 public immutable USDC;
     IOracleHub public oracle;
+
+    // NEW: FX asset from OracleHub (midE6 = NGN per 1 USD) --------------------
+    address public fxAsset; // NEW
+    event FxAssetSet(address fxAsset); // NEW
 
     // Risk / economics
     uint16 public ltvBps = 5000; // 50% LTV
@@ -150,6 +158,14 @@ contract BorrowSupplyV1 {
         emit OracleSet(o);
     }
 
+    /// @notice NEW: set the OracleHub asset used as FX (NGN per 1 USD, scaled 1e6)
+    function setFxAsset(address _fxAsset) external onlyOwner {
+        // NEW
+        require(_fxAsset != address(0), "fx:zero");
+        fxAsset = _fxAsset;
+        emit FxAssetSet(_fxAsset);
+    }
+
     function setParams(
         uint16 _ltvBps,
         uint16 _liqBps,
@@ -183,6 +199,7 @@ contract BorrowSupplyV1 {
     }
 
     // -------------------- Pricing helpers --------------------
+    /// @dev Returns NGN midE6 directly from OracleHub (kept for compatibility/diagnostics)
     function _freshBand(address asset) internal view returns (uint256 pxE6) {
         IOracleHub.BandPayload memory b = oracle.getBand(asset);
         require(b.midE6 > 0, "no band");
@@ -190,7 +207,35 @@ contract BorrowSupplyV1 {
             block.timestamp <= uint256(b.ts) + uint256(oracle.maxStaleness()),
             "stale"
         );
-        return uint256(b.midE6);
+        return uint256(b.midE6); // NGN e6
+    }
+
+    /// @dev NEW: Convert NGN (e6) to USD (e6) using NGN per 1 USD (e6)
+    function _toUsdE6(
+        uint256 ngnPxE6,
+        uint256 ngnPerUsdE6
+    ) internal pure returns (uint256) {
+        // NEW
+        // usd = ngn * 1e6 / (ngn per usd)
+        return (ngnPxE6 * ONE_E6) / ngnPerUsdE6;
+    }
+
+    /// @dev NEW: Read equity NGN mid + FX NGN/USD from OracleHub, return USD mid (e6)
+    function _freshMidUsdE6(
+        address asset
+    ) internal view returns (uint256 pxUsdE6, uint64 ts) {
+        // NEW
+        IOracleHub.BandPayload memory b = oracle.getBand(asset);
+        require(b.midE6 > 0, "band:none");
+        uint64 maxS = oracle.maxStaleness();
+        require(block.timestamp <= uint256(b.ts) + uint256(maxS), "band:stale");
+
+        IOracleHub.BandPayload memory fxB = oracle.getBand(fxAsset);
+        require(fxB.midE6 > 0, "fx:none");
+        require(block.timestamp <= uint256(fxB.ts) + uint256(maxS), "fx:stale");
+
+        pxUsdE6 = _toUsdE6(uint256(b.midE6), uint256(fxB.midE6)); // USD e6
+        ts = b.ts <= fxB.ts ? b.ts : fxB.ts;
     }
 
     // -------------------- Interest model --------------------
@@ -373,7 +418,7 @@ contract BorrowSupplyV1 {
 
         // Simulate after-unlock LTV
         c.qtyE6 -= uint128(qtyE6);
-        bool ok = _isSafe(msg.sender);
+        bool ok = _isSafe(msg.sender); // CHANGED: now uses USD valuation under the hood
         c.qtyE6 += uint128(qtyE6);
         require(ok, "ltv");
 
@@ -419,7 +464,7 @@ contract BorrowSupplyV1 {
 
         // Risk check vs new debt
         uint256 newDebt = borrowPrincipalE6[msg.sender] + amountE6;
-        require(newDebt <= _maxBorrowableE6(msg.sender), "exceeds LTV");
+        require(newDebt <= _maxBorrowableE6(msg.sender), "exceeds LTV"); // CHANGED: _maxBorrowableE6 uses USD valuation
 
         // Liquidity check
         require(USDC.balanceOf(address(this)) >= amountE6, "illiquid");
@@ -451,29 +496,36 @@ contract BorrowSupplyV1 {
     }
 
     // -------------------- Portfolio / Risk views --------------------
+    /// @dev CHANGED: values collateral in USD e6 (converted from NGN mid via FX)
     function _collateralValueE6(
         address user
-    ) internal view returns (uint256 sumE6) {
+    ) internal view returns (uint256 sumUsdE6) {
+        // CHANGED
         address[] memory L = collatList[user];
         for (uint256 i = 0; i < L.length; i++) {
             address a = L[i];
             uint256 qty = collat[user][a].qtyE6;
             if (qty == 0) continue;
-            uint256 px = _freshBand(a); // reverts if stale
-            sumE6 += (qty * px) / ONE_E6;
+
+            (uint256 pxUsdE6, ) = _freshMidUsdE6(a); // USD e6
+            sumUsdE6 += (qty * pxUsdE6) / ONE_E6; // USD e6
         }
     }
 
+    /// @dev CHANGED: returns USD e6 max borrowable using USD-valued collateral
     function _maxBorrowableE6(address user) internal view returns (uint256) {
-        uint256 col = _collateralValueE6(user);
-        return (col * ltvBps) / BPS;
+        // CHANGED
+        uint256 colUsd = _collateralValueE6(user);
+        return (colUsd * ltvBps) / BPS;
     }
 
+    /// @dev CHANGED: safety check in USD e6 terms
     function _isSafe(address user) internal view returns (bool) {
+        // CHANGED
         // Health check at *current* principal (post-accrual call expected by mutators)
-        uint256 col = _collateralValueE6(user);
-        if (col == 0) return borrowPrincipalE6[user] == 0;
-        uint256 lim = (col * ltvBps) / BPS;
+        uint256 colUsd = _collateralValueE6(user);
+        if (colUsd == 0) return borrowPrincipalE6[user] == 0;
+        uint256 lim = (colUsd * ltvBps) / BPS;
         return borrowPrincipalE6[user] <= lim;
     }
 
@@ -483,19 +535,19 @@ contract BorrowSupplyV1 {
         external
         view
         returns (
-            uint256 supplyE6,
-            uint256 borrowE6,
-            uint256 collateralValueE6,
+            uint256 supplyE6, // USDC principal (e6)
+            uint256 borrowE6, // USDC principal (e6)
+            uint256 collateralValueE6, // CHANGED: USD e6 (after NGN→USD conversion)
             uint256 ltvCurrentBps,
-            uint256 maxBorrowE6
+            uint256 maxBorrowE6 // USD e6
         )
     {
         // NOTE: returns *principal snapshots* at last accrual; the UI can call accrue() off-chain or
         // use the lenderBalanceE6 view for supply approximation. Keeping this minimal.
         supplyE6 = supplyPrincipalE6[user];
         borrowE6 = borrowPrincipalE6[user];
-        collateralValueE6 = _collateralValueE6(user);
-        maxBorrowE6 = (collateralValueE6 * ltvBps) / BPS;
+        collateralValueE6 = _collateralValueE6(user); // USD e6
+        maxBorrowE6 = (collateralValueE6 * ltvBps) / BPS; // USD e6
         ltvCurrentBps = collateralValueE6 == 0
             ? 0
             : (borrowE6 * BPS) / collateralValueE6;
