@@ -26,8 +26,6 @@ Settlement is **direct-settle (non-custodial)** via a tiny adapter (`IMoveAdapte
   - [Common errors \& fixes](#common-errors--fixes)
   - [Security notes \& limitations](#security-notes--limitations)
 
----
-
 ## Architecture
 
 ```
@@ -38,8 +36,6 @@ User ↔ CLOB (Clob.sol) ↔ Adapter (IMoveAdapter) → ERC20.transferFrom(...)
 * **Clob**: places, cancels, matches orders; enforces **venue**, **band** interval, and **oracle freshness**.
 * **OracleHub**: stores `BandPayload {midE6, widthBps, ts}` and `PricePayload {priceE6, seq, ts, hcsMsgId}` + `maxStaleness`.
 * **Adapter (Direct-Settle)**: executes three peer-to-peer token movements with `transferFrom` (buyer→seller USDC, buyer→fee USDC, seller→buyer xNGX).
-
----
 
 ## Key contracts
 
@@ -62,7 +58,6 @@ User ↔ CLOB (Clob.sol) ↔ Adapter (IMoveAdapter) → ERC20.transferFrom(...)
 
 > We **do not** use a custody adapter. No pooled balances in contracts.
 
----
 
 **Deploy order**
 
@@ -72,7 +67,6 @@ User ↔ CLOB (Clob.sol) ↔ Adapter (IMoveAdapter) → ERC20.transferFrom(...)
 4. Seed **band & price** in `OracleHub` for each asset (and keep them fresh).
 5. `setVenue(asset, Continuous)` to open the book.
 
----
 
 ## Hedera specifics
 
@@ -127,8 +121,6 @@ await clob.place(ASSET, 1, false, 1_000_000n, 200_000n); // limit SELL
 await clob.matchBest(ASSET, 10); // perform up to 10 matches
 ```
 
----
-
 ## API reference
 
 ### Admin
@@ -164,7 +156,6 @@ await clob.matchBest(ASSET, 10); // perform up to 10 matches
   * Calls adapter to move tokens (buyer→seller USDC, buyer→feeSink USDC, seller→buyer xNGX).
   * Emits `Trade`.
 
----
 
 ## Events
 
@@ -178,7 +169,6 @@ await clob.matchBest(ASSET, 10); // perform up to 10 matches
 * `AdapterSet(adapter)`
 * `OwnerTransferred(newOwner)`
 
----
 
 ## Common errors & fixes
 
@@ -192,17 +182,3 @@ await clob.matchBest(ASSET, 10); // perform up to 10 matches
   * Seller: `approve(adapter, qty)` on **xNGX**
 * **Hedera association/KYC** — ensure buyer/seller (and fee sink for USDC) are **associated** (and **KYC-approved** if xNGX enforces it).
 * **Hardhat `stack too deep`** — enable `viaIR: true` in `solc.settings`.
-
----
-
-## Security notes & limitations
-
-* Order book is **array-backed** (O(n²) matching). Fine for MVP/testnet; replace with sorted structures for scale.
-* Use a **multisig** or timelock for the owner that calls admin functions.
-* Keep the oracle **fresh**; stale data halts matching by design.
-* Consider adding per-order **expiry** and **min-fill** for production.
-* This engine settles trades **atomically**; if any leg fails, the whole trade reverts (no partial fills without state).
-
----
-
-If you want, I can include a tiny **sample `DirectSettleAdapter.sol`** and a one-file **deploy script** snippet under a `scripts/` folder to round out the repo.
